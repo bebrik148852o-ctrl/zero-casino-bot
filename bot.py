@@ -1,19 +1,38 @@
 import asyncio
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.session.aiohttp import AiohttpSession
 
-# Твой токен от BotFather
-TOKEN = "9221238859:AAENx-jshXV0Ui6bXTvLlbs4gk36c23vta4"
+# Твой токен от BotFather (можешь оставить так или брать из переменных окружения Render)
+TOKEN = os.environ.get("TOKEN", "9221238859:AAENx-jshXV0Ui6bXTvLlbs4gk36c23vta4")
 
 # Ссылка на твое казино
 WEB_APP_URL = "https://peaceful-duckanoo-a4cbaf.netlify.app/"
 
-# Настройка локального прокси (который сейчас работает в соседнем терминале)
-session = AiohttpSession(proxy="http://127.0.0.1:8080")
+# --- ЗАГЛУШКА ДЛЯ RENDER (чтобы сервис не засыпал) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive")
 
+def run_health_check():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+# Запускаем сервер в фоновом потоке
+threading.Thread(target=run_health_check, daemon=True).start()
+# ----------------------------------------------------
+
+# Создаем сессию (без прокси, так как Render находится за границей)
+session = AiohttpSession() 
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
@@ -38,4 +57,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
     
