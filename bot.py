@@ -1,61 +1,326 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import sqlite3
+import time
+from contextlib import closing
+from decimal import Decimal, InvalidOperation
+from urllib.parse import parse_qsl, urlsplit
 
 from aiogram import Bot, Dispatcher, types
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.types import WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import web
 
-# Твой токен от BotFather (можешь оставить так или брать из переменных окружения Render)
-TOKEN = os.environ.get("TOKEN", "9221238859:AAENx-jshXV0Ui6bXTvLlbs4gk36c23vta4")
 
-# Ссылка на твое казино
+TOKEN = os.environ.get("TOKEN")
+if not TOKEN:
+    raise RuntimeError("Установите переменную окружения TOKEN.")
+
 WEB_APP_URL = "https://peaceful-duckanoo-a4cbaf.netlify.app/"
+WEB_APP_ORIGIN = f"{urlsplit(WEB_APP_URL).scheme}://{urlsplit(WEB_APP_URL).netloc}"
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "balances.sqlite3")
+PROMO_CODE = "ZEROWIN"
+PROMO_AMOUNT_CENTS = 100_000
+MAX_AUTH_AGE_SECONDS = 24 * 60 * 60
 
-# --- ЗАГЛУШКА ДЛЯ RENDER (чтобы сервис не засыпал) ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
-
-def run_health_check():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
-
-# Запускаем сервер в фоновом потоке
-threading.Thread(target=run_health_check, daemon=True).start()
-# ----------------------------------------------------
-
-# Создаем сессию (без прокси, так как Render находится за границей)
-session = AiohttpSession() 
+session = AiohttpSession()
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
+
+
+def initialize_database():
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS balances (
+                    user_id INTEGER PRIMARY KEY,
+                    balance_cents INTEGER NOT NULL DEFAULT 0
+                        CHECK (balance_cents >= 0)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS promo_redemptions (
+                    user_id INTEGER NOT NULL,
+                    promo_code TEXT NOT NULL,
+                    PRIMARY KEY (user_id, promo_code)
+                )
+                """
+            )
+
+
+def get_balance(user_id):
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        row = connection.execute(
+            "SELECT balance_cents FROM balances WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return Decimal(row[0]) / 100 if row else Decimal(0)
+
+
+def update_balance(user_id, amount):
+    amount_cents = amount * 100
+    if amount_cents != amount_cents.to_integral_value():
+        raise ValueError("Сумма должна быть указана с точностью до копеек.")
+    delta_cents = int(amount_cents)
+
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        with connection:
+            if delta_cents > 0:
+                connection.execute(
+                    "INSERT OR IGNORE INTO balances (user_id) VALUES (?)",
+                    (user_id,),
+                )
+            result = connection.execute(
+                """
+                UPDATE balances
+                SET balance_cents = balance_cents + ?
+                WHERE user_id = ? AND balance_cents + ? >= 0
+                """,
+                (delta_cents, user_id, delta_cents),
+            )
+            if result.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT balance_cents FROM balances WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+    return Decimal(row[0]) / 100
+
+
+def validate_auth(auth_data):
+    if not isinstance(auth_data, str) or not auth_data:
+        return None
+
+    try:
+        pairs = parse_qsl(auth_data, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+
+    if len(dict(pairs)) != len(pairs):
+        return None
+
+    values = dict(pairs)
+    received_hash = values.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(
+        f"{key}={value}" for key, value in sorted(values.items())
+    )
+    secret_key = hmac.new(
+        b"WebAppData",
+        TOKEN.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    expected_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(received_hash, expected_hash):
+        return None
+
+    try:
+        auth_date = int(values["auth_date"])
+        user = json.loads(values["user"])
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return None
+
+    now = int(time.time())
+    if auth_date > now + 60 or now - auth_date > MAX_AUTH_AGE_SECONDS:
+        return None
+    if not isinstance(user, dict):
+        return None
+
+    user_id = user.get("id")
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        return None
+    return user_id
+
+
+def amount_from_payload(payload):
+    value = payload.get("amount")
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not amount.is_finite() or amount <= 0:
+        return None
+    if amount * 100 != (amount * 100).to_integral_value():
+        return None
+    return amount
+
+
+async def read_json(request):
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def api_error(message, status=400):
+    return web.json_response({"ok": False, "error": message}, status=status)
+
+
+async def api_user(request):
+    user_id = validate_auth(request.query.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+    return web.json_response({"ok": True, "balance": float(get_balance(user_id))})
+
+
+async def api_bet(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полями _auth и amount.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    amount = amount_from_payload(payload)
+    if amount is None:
+        return api_error("Некорректная сумма.")
+
+    if get_balance(user_id) < amount:
+        return web.json_response({"ok": False, "error": "Мало денег"})
+
+    balance = update_balance(user_id, -amount)
+    if balance is None:
+        return web.json_response({"ok": False, "error": "Мало денег"})
+    return web.json_response({"ok": True, "balance": float(balance)})
+
+
+async def api_win(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полями _auth и amount.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    amount = amount_from_payload(payload)
+    if amount is None:
+        return api_error("Некорректная сумма.")
+
+    balance = update_balance(user_id, amount)
+    return web.json_response({"ok": True, "balance": float(balance)})
+
+
+def redeem_promo(user_id):
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        with connection:
+            try:
+                connection.execute(
+                    "INSERT INTO promo_redemptions (user_id, promo_code) VALUES (?, ?)",
+                    (user_id, PROMO_CODE),
+                )
+            except sqlite3.IntegrityError:
+                return None
+
+            connection.execute(
+                """
+                INSERT INTO balances (user_id, balance_cents)
+                VALUES (?, ?)
+                ON CONFLICT(user_id)
+                DO UPDATE SET balance_cents = balance_cents + excluded.balance_cents
+                """,
+                (user_id, PROMO_AMOUNT_CENTS),
+            )
+            row = connection.execute(
+                "SELECT balance_cents FROM balances WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+    return Decimal(row[0]) / 100
+
+
+async def api_promo(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полями _auth и promo.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    promo = payload.get("promo")
+    if not isinstance(promo, str) or promo.strip().upper() != PROMO_CODE:
+        return api_error("Неверный промокод.")
+
+    balance = redeem_promo(user_id)
+    if balance is None:
+        return api_error("Промокод уже активирован.")
+    return web.json_response({"ok": True, "balance": float(balance)})
+
+
+async def health_check(request):
+    return web.Response(text="Bot is alive")
+
+
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        response = await handler(request)
+
+    if request.headers.get("Origin") == WEB_APP_ORIGIN:
+        response.headers["Access-Control-Allow-Origin"] = WEB_APP_ORIGIN
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Vary"] = "Origin"
+    return response
+
+
+app = web.Application(middlewares=[cors_middleware])
+app.router.add_get("/", health_check)
+app.router.add_get("/health", health_check)
+app.router.add_get("/api/user", api_user)
+app.router.add_post("/api/bet", api_bet)
+app.router.add_post("/api/win", api_win)
+app.router.add_post("/api/promo", api_promo)
+
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
     builder = InlineKeyboardBuilder()
     builder.button(
-        text="🎰 Открыть ZeroCasino", 
-        web_app=WebAppInfo(url=WEB_APP_URL)
+        text="🎰 Открыть ZeroCasino",
+        web_app=WebAppInfo(url=WEB_APP_URL),
     )
-    
     await message.answer(
         f"Привет, {message.from_user.first_name}! 🦆\n"
         "Добро пожаловать в закрытый клуб ZeroCasino.\n"
-        "Нажми на кнопку ниже, чтобы открыть приложение.", 
-        reply_markup=builder.as_markup()
+        "Нажми на кнопку ниже, чтобы открыть приложение.",
+        reply_markup=builder.as_markup(),
     )
 
+
 async def main():
-    print("Бот запущен! Проверь кнопку в Телеграме.")
-    await dp.start_polling(bot)
+    initialize_database()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
+    await site.start()
+    print("Бот и API запущены.")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
-    
