@@ -55,6 +55,15 @@ def initialize_database():
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stats (
+                    user_id INTEGER PRIMARY KEY,
+                    total_bets INTEGER NOT NULL DEFAULT 0,
+                    total_won INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
 
 
 def get_balance(user_id):
@@ -94,6 +103,57 @@ def update_balance(user_id, amount):
                 (user_id,),
             ).fetchone()
     return Decimal(row[0]) / 100
+
+
+def update_balance_and_stats(user_id, amount, stat_column, stat_increment):
+    if stat_column not in {"total_bets", "total_won"}:
+        raise ValueError("Недопустимый столбец статистики.")
+
+    amount_cents = amount * 100
+    if amount_cents != amount_cents.to_integral_value():
+        raise ValueError("Сумма должна быть указана с точностью до копеек.")
+    delta_cents = int(amount_cents)
+
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        with connection:
+            if delta_cents > 0:
+                connection.execute(
+                    "INSERT OR IGNORE INTO balances (user_id) VALUES (?)",
+                    (user_id,),
+                )
+            result = connection.execute(
+                """
+                UPDATE balances
+                SET balance_cents = balance_cents + ?
+                WHERE user_id = ? AND balance_cents + ? >= 0
+                """,
+                (delta_cents, user_id, delta_cents),
+            )
+            if result.rowcount == 0:
+                return None
+
+            connection.execute(
+                "INSERT OR IGNORE INTO stats (user_id) VALUES (?)",
+                (user_id,),
+            )
+            connection.execute(
+                f"UPDATE stats SET {stat_column} = {stat_column} + ? WHERE user_id = ?",
+                (stat_increment, user_id),
+            )
+            row = connection.execute(
+                "SELECT balance_cents FROM balances WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+    return Decimal(row[0]) / 100
+
+
+def get_stats(user_id):
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        row = connection.execute(
+            "SELECT total_bets, total_won FROM stats WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return row if row else (0, 0)
 
 
 def validate_auth(auth_data):
@@ -205,7 +265,7 @@ async def api_bet(request):
     if get_balance(user_id) < amount:
         return web.json_response({"ok": False, "error": "Мало денег"})
 
-    balance = update_balance(user_id, -amount)
+    balance = update_balance_and_stats(user_id, -amount, "total_bets", 1)
     if balance is None:
         return web.json_response({"ok": False, "error": "Мало денег"})
     return web.json_response({"ok": True, "balance": float(balance)})
@@ -224,8 +284,27 @@ async def api_win(request):
     if amount is None:
         return api_error("Некорректная сумма.")
 
-    balance = update_balance(user_id, amount)
+    amount_cents = int(amount * 100)
+    balance = update_balance_and_stats(user_id, amount, "total_won", amount_cents)
     return web.json_response({"ok": True, "balance": float(balance)})
+
+
+async def api_stats(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полем _auth.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    total_bets, total_won_cents = get_stats(user_id)
+    total_won = Decimal(total_won_cents) / 100
+    return web.json_response({
+        "ok": True,
+        "total_bets": total_bets,
+        "total_won": float(total_won),
+    })
 
 
 def redeem_promo(user_id):
@@ -300,6 +379,7 @@ app.router.add_get("/api/user", api_user)
 app.router.add_post("/api/user", api_user)
 app.router.add_post("/api/bet", api_bet)
 app.router.add_post("/api/win", api_win)
+app.router.add_post("/api/stats", api_stats)
 app.router.add_post("/api/promo", api_promo)
 
 
