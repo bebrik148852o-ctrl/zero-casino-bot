@@ -307,6 +307,28 @@ async def api_stats(request):
     })
 
 
+async def api_winners(request):
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        rows = connection.execute(
+            """
+            SELECT user_id, total_won
+            FROM stats
+            WHERE total_won > 0
+            ORDER BY total_won DESC, user_id ASC
+            LIMIT 3
+            """
+        ).fetchall()
+
+    winners = [
+        {
+            "name": f"Игрок [{user_id}]",
+            "amount": float(Decimal(total_won_cents) / 100),
+        }
+        for user_id, total_won_cents in rows
+    ]
+    return web.json_response({"ok": True, "winners": winners})
+
+
 def redeem_promo(user_id):
     with closing(sqlite3.connect(DATABASE_PATH)) as connection:
         with connection:
@@ -380,6 +402,7 @@ app.router.add_post("/api/user", api_user)
 app.router.add_post("/api/bet", api_bet)
 app.router.add_post("/api/win", api_win)
 app.router.add_post("/api/stats", api_stats)
+app.router.add_post("/api/winners", api_winners)
 app.router.add_post("/api/promo", api_promo)
 
 
