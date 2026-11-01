@@ -5,10 +5,11 @@ import json
 import os
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, urlsplit
 
+import psycopg2
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
@@ -23,7 +24,8 @@ if not TOKEN:
 
 WEB_APP_URL = "https://peaceful-duckanoo-a4cbaf.netlify.app/"
 WEB_APP_ORIGIN = f"{urlsplit(WEB_APP_URL).scheme}://{urlsplit(WEB_APP_URL).netloc}"
-DATABASE_PATH = os.environ.get("DATABASE_PATH", "balances.sqlite3")
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "casino.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 PROMO_CODE = "ZEROWIN"
 PROMO_AMOUNT_CENTS = 10_000
 MAX_AUTH_AGE_SECONDS = 24 * 60 * 60
@@ -34,78 +36,173 @@ bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
 
-def initialize_database():
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        with connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS balances (
-                    user_id INTEGER PRIMARY KEY,
-                    balance_cents INTEGER NOT NULL DEFAULT 0
-                        CHECK (balance_cents >= 0)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS promo_redemptions (
-                    user_id INTEGER NOT NULL,
-                    promo_code TEXT NOT NULL,
-                    PRIMARY KEY (user_id, promo_code)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS stats (
-                    user_id INTEGER PRIMARY KEY,
-                    total_bets INTEGER NOT NULL DEFAULT 0,
-                    total_won INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
+class DatabaseConnection:
+    def __init__(self, connection, is_postgres):
+        self.connection = connection
+        self.is_postgres = is_postgres
+
+    async def fetchone(self, sqlite_query, postgres_query, parameters=()):
+        query = postgres_query if self.is_postgres else sqlite_query
+        return await asyncio.to_thread(self._fetchone, query, parameters)
+
+    async def fetchall(self, sqlite_query, postgres_query, parameters=()):
+        query = postgres_query if self.is_postgres else sqlite_query
+        return await asyncio.to_thread(self._fetchall, query, parameters)
+
+    async def execute(self, sqlite_query, postgres_query, parameters=()):
+        query = postgres_query if self.is_postgres else sqlite_query
+        return await asyncio.to_thread(self._execute, query, parameters)
+
+    def _fetchone(self, query, parameters):
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(query, parameters)
+            return cursor.fetchone()
+        finally:
+            cursor.close()
+
+    def _fetchall(self, query, parameters):
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(query, parameters)
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+
+    def _execute(self, query, parameters):
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(query, parameters)
+            return cursor.rowcount
+        finally:
+            cursor.close()
 
 
-def get_balance(user_id):
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        row = connection.execute(
+@asynccontextmanager
+async def database_transaction():
+    is_postgres = bool(DATABASE_URL)
+    if is_postgres:
+        database_url = DATABASE_URL
+        if database_url.startswith("postgres://"):
+            database_url = "postgresql://" + database_url[len("postgres://"):]
+        connection = await asyncio.to_thread(psycopg2.connect, database_url)
+    else:
+        connection = await asyncio.to_thread(
+            sqlite3.connect,
+            DATABASE_PATH,
+            check_same_thread=False,
+        )
+        await asyncio.to_thread(connection.execute, "BEGIN")
+
+    try:
+        yield DatabaseConnection(connection, is_postgres)
+        await asyncio.to_thread(connection.commit)
+    except BaseException:
+        await asyncio.to_thread(connection.rollback)
+        raise
+    finally:
+        await asyncio.to_thread(connection.close)
+
+
+async def initialize_database():
+    async with database_transaction() as connection:
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS balances (
+                user_id BIGINT PRIMARY KEY,
+                balance_cents BIGINT NOT NULL DEFAULT 0
+                    CHECK (balance_cents >= 0)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS balances (
+                user_id BIGINT PRIMARY KEY,
+                balance_cents BIGINT NOT NULL DEFAULT 0
+                    CHECK (balance_cents >= 0)
+            )
+            """,
+        )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promo_redemptions (
+                user_id BIGINT NOT NULL,
+                promo_code TEXT NOT NULL,
+                PRIMARY KEY (user_id, promo_code)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS promo_redemptions (
+                user_id BIGINT NOT NULL,
+                promo_code TEXT NOT NULL,
+                PRIMARY KEY (user_id, promo_code)
+            )
+            """,
+        )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stats (
+                user_id BIGINT PRIMARY KEY,
+                total_bets BIGINT NOT NULL DEFAULT 0,
+                total_won BIGINT NOT NULL DEFAULT 0
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS stats (
+                user_id BIGINT PRIMARY KEY,
+                total_bets BIGINT NOT NULL DEFAULT 0,
+                total_won BIGINT NOT NULL DEFAULT 0
+            )
+            """,
+        )
+
+
+async def get_balance(user_id):
+    async with database_transaction() as connection:
+        row = await connection.fetchone(
             "SELECT balance_cents FROM balances WHERE user_id = ?",
+            "SELECT balance_cents FROM balances WHERE user_id = %s",
             (user_id,),
-        ).fetchone()
+        )
     return Decimal(row[0]) / 100 if row else Decimal(0)
 
 
-def update_balance(user_id, amount):
+async def update_balance(user_id, amount):
     amount_cents = amount * 100
     if amount_cents != amount_cents.to_integral_value():
         raise ValueError("Сумма должна быть указана с точностью до копеек.")
     delta_cents = int(amount_cents)
 
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        with connection:
-            if delta_cents > 0:
-                connection.execute(
-                    "INSERT OR IGNORE INTO balances (user_id) VALUES (?)",
-                    (user_id,),
-                )
-            result = connection.execute(
-                """
-                UPDATE balances
-                SET balance_cents = balance_cents + ?
-                WHERE user_id = ? AND balance_cents + ? >= 0
-                """,
-                (delta_cents, user_id, delta_cents),
-            )
-            if result.rowcount == 0:
-                return None
-            row = connection.execute(
-                "SELECT balance_cents FROM balances WHERE user_id = ?",
+    async with database_transaction() as connection:
+        if delta_cents > 0:
+            await connection.execute(
+                "INSERT INTO balances (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+                "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
                 (user_id,),
-            ).fetchone()
+            )
+        updated = await connection.execute(
+            """
+            UPDATE balances
+            SET balance_cents = balance_cents + ?
+            WHERE user_id = ? AND balance_cents + ? >= 0
+            """,
+            """
+            UPDATE balances
+            SET balance_cents = balance_cents + %s
+            WHERE user_id = %s AND balance_cents + %s >= 0
+            """,
+            (delta_cents, user_id, delta_cents),
+        )
+        if updated == 0:
+            return None
+        row = await connection.fetchone(
+            "SELECT balance_cents FROM balances WHERE user_id = ?",
+            "SELECT balance_cents FROM balances WHERE user_id = %s",
+            (user_id,),
+        )
     return Decimal(row[0]) / 100
 
 
-def update_balance_and_stats(user_id, amount, stat_column, stat_increment):
+async def update_balance_and_stats(user_id, amount, stat_column, stat_increment):
     if stat_column not in {"total_bets", "total_won"}:
         raise ValueError("Недопустимый столбец статистики.")
 
@@ -114,45 +211,54 @@ def update_balance_and_stats(user_id, amount, stat_column, stat_increment):
         raise ValueError("Сумма должна быть указана с точностью до копеек.")
     delta_cents = int(amount_cents)
 
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        with connection:
-            if delta_cents > 0:
-                connection.execute(
-                    "INSERT OR IGNORE INTO balances (user_id) VALUES (?)",
-                    (user_id,),
-                )
-            result = connection.execute(
-                """
-                UPDATE balances
-                SET balance_cents = balance_cents + ?
-                WHERE user_id = ? AND balance_cents + ? >= 0
-                """,
-                (delta_cents, user_id, delta_cents),
+    async with database_transaction() as connection:
+        if delta_cents > 0:
+            await connection.execute(
+                "INSERT INTO balances (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+                "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+                (user_id,),
             )
-            if result.rowcount == 0:
-                return None
+        updated = await connection.execute(
+            """
+            UPDATE balances
+            SET balance_cents = balance_cents + ?
+            WHERE user_id = ? AND balance_cents + ? >= 0
+            """,
+            """
+            UPDATE balances
+            SET balance_cents = balance_cents + %s
+            WHERE user_id = %s AND balance_cents + %s >= 0
+            """,
+            (delta_cents, user_id, delta_cents),
+        )
+        if updated == 0:
+            return None
 
-            connection.execute(
-                "INSERT OR IGNORE INTO stats (user_id) VALUES (?)",
-                (user_id,),
-            )
-            connection.execute(
-                f"UPDATE stats SET {stat_column} = {stat_column} + ? WHERE user_id = ?",
-                (stat_increment, user_id),
-            )
-            row = connection.execute(
-                "SELECT balance_cents FROM balances WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
+        await connection.execute(
+            "INSERT INTO stats (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO stats (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+            (user_id,),
+        )
+        await connection.execute(
+            f"UPDATE stats SET {stat_column} = {stat_column} + ? WHERE user_id = ?",
+            f"UPDATE stats SET {stat_column} = {stat_column} + %s WHERE user_id = %s",
+            (stat_increment, user_id),
+        )
+        row = await connection.fetchone(
+            "SELECT balance_cents FROM balances WHERE user_id = ?",
+            "SELECT balance_cents FROM balances WHERE user_id = %s",
+            (user_id,),
+        )
     return Decimal(row[0]) / 100
 
 
-def get_stats(user_id):
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        row = connection.execute(
+async def get_stats(user_id):
+    async with database_transaction() as connection:
+        row = await connection.fetchone(
             "SELECT total_bets, total_won FROM stats WHERE user_id = ?",
+            "SELECT total_bets, total_won FROM stats WHERE user_id = %s",
             (user_id,),
-        ).fetchone()
+        )
     return row if row else (0, 0)
 
 
@@ -246,7 +352,10 @@ async def api_user(request):
     user_id = validate_auth(auth_data)
     if user_id is None:
         return api_error("Недействительная авторизация", status=401)
-    return web.json_response({"ok": True, "balance": float(get_balance(user_id))})
+    return web.json_response({
+        "ok": True,
+        "balance": float(await get_balance(user_id)),
+    })
 
 
 async def api_bet(request):
@@ -262,10 +371,10 @@ async def api_bet(request):
     if amount is None:
         return api_error("Некорректная сумма.")
 
-    if get_balance(user_id) < amount:
+    if await get_balance(user_id) < amount:
         return web.json_response({"ok": False, "error": "Мало денег"})
 
-    balance = update_balance_and_stats(user_id, -amount, "total_bets", 1)
+    balance = await update_balance_and_stats(user_id, -amount, "total_bets", 1)
     if balance is None:
         return web.json_response({"ok": False, "error": "Мало денег"})
     return web.json_response({"ok": True, "balance": float(balance)})
@@ -285,7 +394,12 @@ async def api_win(request):
         return api_error("Некорректная сумма.")
 
     amount_cents = int(amount * 100)
-    balance = update_balance_and_stats(user_id, amount, "total_won", amount_cents)
+    balance = await update_balance_and_stats(
+        user_id,
+        amount,
+        "total_won",
+        amount_cents,
+    )
     return web.json_response({"ok": True, "balance": float(balance)})
 
 
@@ -298,7 +412,7 @@ async def api_stats(request):
     if user_id is None:
         return api_error("Недействительная авторизация", status=401)
 
-    total_bets, total_won_cents = get_stats(user_id)
+    total_bets, total_won_cents = await get_stats(user_id)
     total_won = Decimal(total_won_cents) / 100
     return web.json_response({
         "ok": True,
@@ -308,51 +422,66 @@ async def api_stats(request):
 
 
 async def api_winners(request):
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        rows = connection.execute(
+    async with database_transaction() as connection:
+        rows = await connection.fetchall(
             """
             SELECT user_id, total_won
             FROM stats
             WHERE total_won > 0
             ORDER BY total_won DESC, user_id ASC
             LIMIT 3
+            """,
             """
-        ).fetchall()
+            SELECT user_id, total_won
+            FROM stats
+            WHERE total_won > 0
+            ORDER BY total_won DESC, user_id ASC
+            LIMIT 3
+            """,
+        )
 
-    winners = [
-        {
+    winners = []
+    for row in rows:
+        user_id, total_won_cents = row[0], row[1]
+        winners.append({
             "name": f"Игрок [{user_id}]",
             "amount": float(Decimal(total_won_cents) / 100),
-        }
-        for user_id, total_won_cents in rows
-    ]
+        })
     return web.json_response({"ok": True, "winners": winners})
 
 
-def redeem_promo(user_id):
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        with connection:
-            try:
-                connection.execute(
-                    "INSERT INTO promo_redemptions (user_id, promo_code) VALUES (?, ?)",
-                    (user_id, PROMO_CODE),
-                )
-            except sqlite3.IntegrityError:
-                return None
+async def redeem_promo(user_id):
+    async with database_transaction() as connection:
+        inserted = await connection.execute(
+            "INSERT INTO promo_redemptions (user_id, promo_code) VALUES (?, ?) "
+            "ON CONFLICT(user_id, promo_code) DO NOTHING",
+            "INSERT INTO promo_redemptions (user_id, promo_code) VALUES (%s, %s) "
+            "ON CONFLICT(user_id, promo_code) DO NOTHING",
+            (user_id, PROMO_CODE),
+        )
+        if inserted == 0:
+            return None
 
-            connection.execute(
-                """
-                INSERT INTO balances (user_id, balance_cents)
-                VALUES (?, ?)
-                ON CONFLICT(user_id)
-                DO UPDATE SET balance_cents = balance_cents + excluded.balance_cents
-                """,
-                (user_id, PROMO_AMOUNT_CENTS),
-            )
-            row = connection.execute(
-                "SELECT balance_cents FROM balances WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
+        await connection.execute(
+            """
+            INSERT INTO balances (user_id, balance_cents)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET balance_cents = balance_cents + excluded.balance_cents
+            """,
+            """
+            INSERT INTO balances (user_id, balance_cents)
+            VALUES (%s, %s)
+            ON CONFLICT(user_id)
+            DO UPDATE SET balance_cents = balances.balance_cents + excluded.balance_cents
+            """,
+            (user_id, PROMO_AMOUNT_CENTS),
+        )
+        row = await connection.fetchone(
+            "SELECT balance_cents FROM balances WHERE user_id = ?",
+            "SELECT balance_cents FROM balances WHERE user_id = %s",
+            (user_id,),
+        )
     return Decimal(row[0]) / 100
 
 
@@ -369,7 +498,7 @@ async def api_promo(request):
     if not isinstance(promo, str) or promo.strip().upper() != PROMO_CODE:
         return api_error("Неверный промокод.")
 
-    balance = redeem_promo(user_id)
+    balance = await redeem_promo(user_id)
     if balance is None:
         return api_error("Промокод уже активирован.")
     return web.json_response({"ok": True, "balance": float(balance)})
@@ -453,7 +582,7 @@ async def give_command(message: types.Message):
         return
 
     user_id, amount = parsed
-    balance = update_balance(user_id, amount)
+    balance = await update_balance(user_id, amount)
     if balance is None:
         await message.answer("Не удалось начислить сумму игроку.")
         return
@@ -474,22 +603,23 @@ async def set_balance_command(message: types.Message):
 
     user_id, amount = parsed
     amount_cents = int(amount * 100)
-    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
-        with connection:
-            connection.execute(
-                "INSERT OR IGNORE INTO balances (user_id) VALUES (?)",
-                (user_id,),
-            )
-            connection.execute(
-                "UPDATE balances SET balance_cents = ? WHERE user_id = ?",
-                (amount_cents, user_id),
-            )
+    async with database_transaction() as connection:
+        await connection.execute(
+            "INSERT INTO balances (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+            (user_id,),
+        )
+        await connection.execute(
+            "UPDATE balances SET balance_cents = ? WHERE user_id = ?",
+            "UPDATE balances SET balance_cents = %s WHERE user_id = %s",
+            (amount_cents, user_id),
+        )
 
     await message.answer(f"Баланс игрока {user_id} установлен: {amount:.2f} ₽.")
 
 
 async def main():
-    initialize_database()
+    await initialize_database()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
