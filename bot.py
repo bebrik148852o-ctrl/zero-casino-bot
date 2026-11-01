@@ -25,8 +25,9 @@ WEB_APP_URL = "https://peaceful-duckanoo-a4cbaf.netlify.app/"
 WEB_APP_ORIGIN = f"{urlsplit(WEB_APP_URL).scheme}://{urlsplit(WEB_APP_URL).netloc}"
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "balances.sqlite3")
 PROMO_CODE = "ZEROWIN"
-PROMO_AMOUNT_CENTS = 100_000
+PROMO_AMOUNT_CENTS = 10_000
 MAX_AUTH_AGE_SECONDS = 24 * 60 * 60
+ADMIN_ID = 8716395955
 
 session = AiohttpSession()
 bot = Bot(token=TOKEN, session=session)
@@ -174,7 +175,15 @@ def api_error(message, status=400):
 
 
 async def api_user(request):
-    user_id = validate_auth(request.query.get("_auth", ""))
+    if request.method == "POST":
+        payload = await read_json(request)
+        if payload is None:
+            return api_error("Ожидается JSON с полем _auth.")
+        auth_data = payload.get("_auth", "")
+    else:
+        auth_data = request.query.get("_auth", "")
+
+    user_id = validate_auth(auth_data)
     if user_id is None:
         return api_error("Недействительная авторизация", status=401)
     return web.json_response({"ok": True, "balance": float(get_balance(user_id))})
@@ -288,6 +297,7 @@ app = web.Application(middlewares=[cors_middleware])
 app.router.add_get("/", health_check)
 app.router.add_get("/health", health_check)
 app.router.add_get("/api/user", api_user)
+app.router.add_post("/api/user", api_user)
 app.router.add_post("/api/bet", api_bet)
 app.router.add_post("/api/win", api_win)
 app.router.add_post("/api/promo", api_promo)
@@ -306,6 +316,73 @@ async def start(message: types.Message):
         "Нажми на кнопку ниже, чтобы открыть приложение.",
         reply_markup=builder.as_markup(),
     )
+
+
+def parse_admin_command_amount(message: types.Message):
+    if not message.text:
+        return None
+
+    parts = message.text.split()
+    if len(parts) != 3:
+        return None
+
+    try:
+        user_id = int(parts[1])
+        amount = Decimal(parts[2])
+    except (ValueError, InvalidOperation):
+        return None
+
+    if user_id <= 0 or not amount.is_finite():
+        return None
+    if amount * 100 != (amount * 100).to_integral_value():
+        return None
+    return user_id, amount
+
+
+@dp.message(Command("give"))
+async def give_command(message: types.Message):
+    if message.from_user is None or message.from_user.id != ADMIN_ID:
+        return
+
+    parsed = parse_admin_command_amount(message)
+    if parsed is None or parsed[1] <= 0:
+        await message.answer("Формат: /give ID_игрока СУММА (сумма должна быть положительной).")
+        return
+
+    user_id, amount = parsed
+    balance = update_balance(user_id, amount)
+    if balance is None:
+        await message.answer("Не удалось начислить сумму игроку.")
+        return
+    await message.answer(
+        f"Игроку {user_id} начислено {amount:.2f} ₽. Баланс: {balance:.2f} ₽."
+    )
+
+
+@dp.message(Command("setbal"))
+async def set_balance_command(message: types.Message):
+    if message.from_user is None or message.from_user.id != ADMIN_ID:
+        return
+
+    parsed = parse_admin_command_amount(message)
+    if parsed is None or parsed[1] < 0:
+        await message.answer("Формат: /setbal ID_игрока СУММА (сумма не может быть отрицательной).")
+        return
+
+    user_id, amount = parsed
+    amount_cents = int(amount * 100)
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        with connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO balances (user_id) VALUES (?)",
+                (user_id,),
+            )
+            connection.execute(
+                "UPDATE balances SET balance_cents = ? WHERE user_id = ?",
+                (amount_cents, user_id),
+            )
+
+    await message.answer(f"Баланс игрока {user_id} установлен: {amount:.2f} ₽.")
 
 
 async def main():
