@@ -2,10 +2,12 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, urlsplit
 
@@ -79,7 +81,7 @@ class DatabaseConnection:
 
 
 @asynccontextmanager
-async def database_transaction():
+async def database_transaction(immediate=False):
     is_postgres = bool(DATABASE_URL)
     if is_postgres:
         database_url = DATABASE_URL
@@ -92,7 +94,8 @@ async def database_transaction():
             DATABASE_PATH,
             check_same_thread=False,
         )
-        await asyncio.to_thread(connection.execute, "BEGIN")
+        begin_statement = "BEGIN IMMEDIATE" if immediate else "BEGIN"
+        await asyncio.to_thread(connection.execute, begin_statement)
 
     try:
         yield DatabaseConnection(connection, is_postgres)
@@ -158,16 +161,35 @@ async def initialize_database():
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
-                referrer_id BIGINT
+                referrer_id BIGINT,
+                last_daily DATETIME
             )
             """,
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
-                referrer_id BIGINT
+                referrer_id BIGINT,
+                last_daily TIMESTAMP
             )
             """,
         )
+        columns = await connection.fetchall(
+            "PRAGMA table_info(users)",
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'users'
+            """,
+        )
+        has_last_daily = (
+            any(column[1] == "last_daily" for column in columns)
+            if not connection.is_postgres
+            else any(column[0] == "last_daily" for column in columns)
+        )
+        if not has_last_daily:
+            await connection.execute(
+                "ALTER TABLE users ADD COLUMN last_daily DATETIME",
+                "ALTER TABLE users ADD COLUMN last_daily TIMESTAMP",
+            )
         await connection.execute(
             """
             INSERT INTO users (user_id)
@@ -213,40 +235,90 @@ async def get_balance(user_id):
     return Decimal(row[0]) / 100 if row else Decimal(0)
 
 
-async def update_balance(user_id, amount):
+async def update_balance_in_transaction(connection, user_id, amount):
     amount_cents = amount * 100
     if amount_cents != amount_cents.to_integral_value():
         raise ValueError("Сумма должна быть указана с точностью до копеек.")
     delta_cents = int(amount_cents)
 
-    async with database_transaction() as connection:
-        if delta_cents > 0:
-            await connection.execute(
-                "INSERT INTO balances (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
-                "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
-                (user_id,),
-            )
-        updated = await connection.execute(
-            """
-            UPDATE balances
-            SET balance_cents = balance_cents + ?
-            WHERE user_id = ? AND balance_cents + ? >= 0
-            """,
-            """
-            UPDATE balances
-            SET balance_cents = balance_cents + %s
-            WHERE user_id = %s AND balance_cents + %s >= 0
-            """,
-            (delta_cents, user_id, delta_cents),
-        )
-        if updated == 0:
-            return None
-        row = await connection.fetchone(
-            "SELECT balance_cents FROM balances WHERE user_id = ?",
-            "SELECT balance_cents FROM balances WHERE user_id = %s",
+    if delta_cents > 0:
+        await connection.execute(
+            "INSERT INTO balances (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO balances (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
             (user_id,),
         )
+    updated = await connection.execute(
+        """
+        UPDATE balances
+        SET balance_cents = balance_cents + ?
+        WHERE user_id = ? AND balance_cents + ? >= 0
+        """,
+        """
+        UPDATE balances
+        SET balance_cents = balance_cents + %s
+        WHERE user_id = %s AND balance_cents + %s >= 0
+        """,
+        (delta_cents, user_id, delta_cents),
+    )
+    if updated == 0:
+        return None
+    row = await connection.fetchone(
+        "SELECT balance_cents FROM balances WHERE user_id = ?",
+        "SELECT balance_cents FROM balances WHERE user_id = %s",
+        (user_id,),
+    )
     return Decimal(row[0]) / 100
+
+
+async def update_balance(user_id, amount):
+    async with database_transaction() as connection:
+        return await update_balance_in_transaction(connection, user_id, amount)
+
+
+async def claim_daily_bonus(user_id):
+    async with database_transaction(immediate=True) as connection:
+        await connection.execute(
+            "INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+            (user_id,),
+        )
+
+        lock_suffix = "" if not connection.is_postgres else " FOR UPDATE"
+        row = await connection.fetchone(
+            f"SELECT last_daily FROM users WHERE user_id = ?{lock_suffix}",
+            f"SELECT last_daily FROM users WHERE user_id = %s{lock_suffix}",
+            (user_id,),
+        )
+
+        now = datetime.now(timezone.utc)
+        last_daily = row[0]
+        if isinstance(last_daily, str):
+            last_daily = datetime.fromisoformat(last_daily)
+        if last_daily is not None:
+            if last_daily.tzinfo is None:
+                last_daily = last_daily.replace(tzinfo=timezone.utc)
+            else:
+                last_daily = last_daily.astimezone(timezone.utc)
+            elapsed = now - last_daily
+            cooldown = timedelta(hours=24)
+            if elapsed <= cooldown:
+                remaining_seconds = (cooldown - elapsed).total_seconds()
+                return None, max(1, math.ceil(remaining_seconds / 3600))
+
+        balance = await update_balance_in_transaction(
+            connection,
+            user_id,
+            Decimal("50"),
+        )
+        if balance is None:
+            raise RuntimeError(f"Не удалось начислить ежедневный бонус пользователю {user_id}.")
+
+        await connection.execute(
+            "UPDATE users SET last_daily = ? WHERE user_id = ?",
+            "UPDATE users SET last_daily = %s WHERE user_id = %s",
+            (now.replace(tzinfo=None), user_id),
+        )
+    return balance, None
 
 
 async def update_balance_and_stats(user_id, amount, stat_column, stat_increment):
@@ -551,6 +623,28 @@ async def api_promo(request):
     return web.json_response({"ok": True, "balance": float(balance)})
 
 
+async def api_daily(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полем _auth.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    balance, hours_remaining = await claim_daily_bonus(user_id)
+    if hours_remaining is not None:
+        return web.json_response({
+            "ok": False,
+            "message": f"Бонус будет доступен через {hours_remaining} часов",
+        })
+    return web.json_response({
+        "ok": True,
+        "message": "Бонус получен!",
+        "balance": float(balance),
+    })
+
+
 async def health_check(request):
     return web.Response(text="Bot is alive")
 
@@ -580,6 +674,7 @@ app.router.add_post("/api/win", api_win)
 app.router.add_post("/api/stats", api_stats)
 app.router.add_post("/api/winners", api_winners)
 app.router.add_post("/api/promo", api_promo)
+app.router.add_post("/api/daily", api_daily)
 
 
 @dp.message(Command("start"))
