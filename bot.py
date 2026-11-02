@@ -24,7 +24,7 @@ TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise RuntimeError("Установите переменную окружения TOKEN.")
 
-WEB_APP_URL = "https://peaceful-duckanoo-a4cbaf.netlify.app/"
+WEB_APP_URL = "https://still-bonus-3827.bebrik1488-52o.workers.dev"
 WEB_APP_ORIGIN = f"{urlsplit(WEB_APP_URL).scheme}://{urlsplit(WEB_APP_URL).netloc}"
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "casino.db")
 DATABASE_URL = os.environ.get("DATABASE_URL")
