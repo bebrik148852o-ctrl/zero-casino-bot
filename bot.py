@@ -154,6 +154,53 @@ async def initialize_database():
             )
             """,
         )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                referrer_id BIGINT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                referrer_id BIGINT
+            )
+            """,
+        )
+        await connection.execute(
+            """
+            INSERT INTO users (user_id)
+            SELECT user_id FROM balances WHERE 1 = 1
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            """
+            INSERT INTO users (user_id)
+            SELECT user_id FROM balances WHERE 1 = 1
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+        )
+
+
+async def register_user(user_id, referrer_id=None):
+    async with database_transaction() as connection:
+        if referrer_id is not None:
+            inviter = await connection.fetchone(
+                "SELECT user_id FROM users WHERE user_id = ?",
+                "SELECT user_id FROM users WHERE user_id = %s",
+                (referrer_id,),
+            )
+            if inviter is None:
+                referrer_id = None
+
+        inserted = await connection.execute(
+            "INSERT INTO users (user_id, referrer_id) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO users (user_id, referrer_id) VALUES (%s, %s) "
+            "ON CONFLICT(user_id) DO NOTHING",
+            (user_id, referrer_id),
+        )
+    return referrer_id if inserted == 1 else None
 
 
 async def get_balance(user_id):
@@ -537,6 +584,20 @@ app.router.add_post("/api/promo", api_promo)
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
+    if message.from_user is None:
+        return
+
+    referrer_id = None
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("ref_"):
+        referrer_text = parts[1][4:]
+        if referrer_text.isascii() and referrer_text.isdigit():
+            candidate_id = int(referrer_text)
+            if candidate_id > 0 and candidate_id != message.from_user.id:
+                referrer_id = candidate_id
+
+    new_referrer_id = await register_user(message.from_user.id, referrer_id)
+
     builder = InlineKeyboardBuilder()
     builder.button(
         text="🎰 Открыть ZeroCasino",
@@ -548,6 +609,27 @@ async def start(message: types.Message):
         "Нажми на кнопку ниже, чтобы открыть приложение.",
         reply_markup=builder.as_markup(),
     )
+
+    if new_referrer_id is not None:
+        balance = await update_balance(new_referrer_id, Decimal("100"))
+        if balance is None:
+            raise RuntimeError(f"Не удалось начислить реферальный бонус пользователю {new_referrer_id}.")
+        await bot.send_message(
+            new_referrer_id,
+            "🎉 По твоей ссылке зашел новый игрок! Тебе начислено 100 ₽",
+        )
+
+
+@dp.message(Command("invite"))
+async def invite_command(message: types.Message):
+    if message.from_user is None:
+        return
+
+    await register_user(message.from_user.id)
+    invite_link = (
+        f"https://t.me/ZeroCasinoX_bot?start=ref_{message.from_user.id}"
+    )
+    await message.answer(f"Твоя персональная ссылка для приглашения:\n{invite_link}")
 
 
 def parse_admin_command_amount(message: types.Message):
