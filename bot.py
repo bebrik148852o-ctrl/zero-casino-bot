@@ -4,11 +4,12 @@ import hmac
 import json
 import math
 import os
+import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import parse_qsl, urlsplit
 
 import psycopg2
@@ -30,7 +31,26 @@ DATABASE_PATH = os.environ.get("DATABASE_PATH", "casino.db")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PROMO_CODE = "ZEROWIN"
 PROMO_AMOUNT_CENTS = 10_000
+PROMO_CODES = {
+    PROMO_CODE: PROMO_AMOUNT_CENTS,
+    "ANTON67": 6_700,
+}
 MAX_AUTH_AGE_SECONDS = 24 * 60 * 60
+PLINKO_ROWS = 8
+PLINKO_MULTIPLIERS = (
+    Decimal("10"),
+    Decimal("3"),
+    Decimal("1.5"),
+    Decimal("0.5"),
+    Decimal("0.2"),
+    Decimal("0.5"),
+    Decimal("1.5"),
+    Decimal("3"),
+    Decimal("10"),
+)
+ANTON_SLOT_MIN_STAKE = Decimal("1000000")
+ANTON_SLOT_MAX_STAKE = Decimal("100000000")
+ANTON_SLOT_MULTIPLIERS = (3, 10, 50)
 ADMIN_ID = 8716395955
 
 session = AiohttpSession()
@@ -162,14 +182,16 @@ async def initialize_database():
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 referrer_id BIGINT,
-                last_daily DATETIME
+                last_daily DATETIME,
+                last_spin DATETIME
             )
             """,
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 referrer_id BIGINT,
-                last_daily TIMESTAMP
+                last_daily TIMESTAMP,
+                last_spin TIMESTAMP
             )
             """,
         )
@@ -189,6 +211,16 @@ async def initialize_database():
             await connection.execute(
                 "ALTER TABLE users ADD COLUMN last_daily DATETIME",
                 "ALTER TABLE users ADD COLUMN last_daily TIMESTAMP",
+            )
+        has_last_spin = (
+            any(column[1] == "last_spin" for column in columns)
+            if not connection.is_postgres
+            else any(column[0] == "last_spin" for column in columns)
+        )
+        if not has_last_spin:
+            await connection.execute(
+                "ALTER TABLE users ADD COLUMN last_spin DATETIME",
+                "ALTER TABLE users ADD COLUMN last_spin TIMESTAMP",
             )
         await connection.execute(
             """
@@ -319,6 +351,44 @@ async def claim_daily_bonus(user_id):
             (now.replace(tzinfo=None), user_id),
         )
     return balance, None
+
+
+async def claim_wheel_spin(user_id):
+    async with database_transaction(immediate=True) as connection:
+        await connection.execute(
+            "INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+            (user_id,),
+        )
+
+        lock_suffix = "" if not connection.is_postgres else " FOR UPDATE"
+        row = await connection.fetchone(
+            f"SELECT last_spin FROM users WHERE user_id = ?{lock_suffix}",
+            f"SELECT last_spin FROM users WHERE user_id = %s{lock_suffix}",
+            (user_id,),
+        )
+
+        now = datetime.now(timezone.utc)
+        last_spin = row[0]
+        if isinstance(last_spin, str):
+            last_spin = datetime.fromisoformat(last_spin)
+        if last_spin is not None:
+            if last_spin.tzinfo is None:
+                last_spin = last_spin.replace(tzinfo=timezone.utc)
+            else:
+                last_spin = last_spin.astimezone(timezone.utc)
+            cooldown = timedelta(hours=24)
+            elapsed = now - last_spin
+            if elapsed < cooldown:
+                remaining_seconds = (cooldown - elapsed).total_seconds()
+                return None, max(1, math.ceil(remaining_seconds / 3600))
+
+        await connection.execute(
+            "UPDATE users SET last_spin = ? WHERE user_id = ?",
+            "UPDATE users SET last_spin = %s WHERE user_id = %s",
+            (now.replace(tzinfo=None), user_id),
+        )
+    return True, None
 
 
 async def update_balance_and_stats(user_id, amount, stat_column, stat_increment):
@@ -522,6 +592,126 @@ async def api_win(request):
     return web.json_response({"ok": True, "balance": float(balance)})
 
 
+async def api_plinko(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полями _auth и amount.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    amount = amount_from_payload(payload)
+    if amount is None:
+        return api_error("Некорректная сумма.")
+    if amount < Decimal("1") or amount > Decimal("10000"):
+        return api_error("Ставка должна быть от 1 до 10 000 ₽.")
+
+    path = [secrets.randbelow(2) for _ in range(PLINKO_ROWS)]
+    slot_index = sum(path)
+    multiplier = PLINKO_MULTIPLIERS[slot_index]
+    payout = (amount * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    payout_cents = int(payout * 100)
+
+    async with database_transaction(immediate=True) as connection:
+        balance_after_bet = await update_balance_in_transaction(
+            connection,
+            user_id,
+            -amount,
+        )
+        if balance_after_bet is None:
+            return web.json_response({"ok": False, "error": "Мало денег"})
+
+        balance = await update_balance_in_transaction(connection, user_id, payout)
+        if balance is None:
+            raise RuntimeError(f"Не удалось начислить Plinko-выплату пользователю {user_id}.")
+
+        await connection.execute(
+            "INSERT INTO stats (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO stats (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+            (user_id,),
+        )
+        await connection.execute(
+            "UPDATE stats SET total_bets = total_bets + 1, total_won = total_won + ? WHERE user_id = ?",
+            "UPDATE stats SET total_bets = total_bets + 1, total_won = total_won + %s WHERE user_id = %s",
+            (payout_cents, user_id),
+        )
+
+    return web.json_response({
+        "ok": True,
+        "path": path,
+        "slot_index": slot_index,
+        "multiplier": float(multiplier),
+        "payout": float(payout),
+        "balance_after_bet": float(balance_after_bet),
+        "balance": float(balance),
+    })
+
+
+async def api_anton_slots(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полями _auth и amount.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    amount = amount_from_payload(payload)
+    if (
+        amount is None
+        or amount < ANTON_SLOT_MIN_STAKE
+        or amount > ANTON_SLOT_MAX_STAKE
+        or amount != amount.to_integral_value()
+    ):
+        return api_error("Ставка должна быть целым числом от 1 000 000 до 100 000 000 ₽.")
+
+    symbols = [secrets.randbelow(3) for _ in range(9)]
+    winning_rows = [
+        row for row in range(3)
+        if symbols[row * 3] == symbols[row * 3 + 1] == symbols[row * 3 + 2]
+    ]
+    multiplier = secrets.choice(ANTON_SLOT_MULTIPLIERS) if winning_rows else 0
+    payout = amount * multiplier
+    payout_cents = int(payout * 100)
+
+    async with database_transaction(immediate=True) as connection:
+        balance_after_bet = await update_balance_in_transaction(
+            connection,
+            user_id,
+            -amount,
+        )
+        if balance_after_bet is None:
+            return web.json_response({"ok": False, "error": "Мало денег"})
+
+        balance = balance_after_bet
+        if payout > 0:
+            balance = await update_balance_in_transaction(connection, user_id, payout)
+            if balance is None:
+                raise RuntimeError(f"Не удалось начислить ANTON SLOTS-выигрыш пользователю {user_id}.")
+
+        await connection.execute(
+            "INSERT INTO stats (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO stats (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+            (user_id,),
+        )
+        await connection.execute(
+            "UPDATE stats SET total_bets = total_bets + 1, total_won = total_won + ? WHERE user_id = ?",
+            "UPDATE stats SET total_bets = total_bets + 1, total_won = total_won + %s WHERE user_id = %s",
+            (payout_cents, user_id),
+        )
+
+    return web.json_response({
+        "ok": True,
+        "symbols": symbols,
+        "winning_rows": winning_rows,
+        "multiplier": multiplier,
+        "payout": float(payout),
+        "balance_after_bet": float(balance_after_bet),
+        "balance": float(balance),
+    })
+
+
 async def api_stats(request):
     payload = await read_json(request)
     if payload is None:
@@ -569,39 +759,26 @@ async def api_winners(request):
     return web.json_response({"ok": True, "winners": winners})
 
 
-async def redeem_promo(user_id):
-    async with database_transaction() as connection:
+async def redeem_promo(user_id, promo_code, amount_cents):
+    async with database_transaction(immediate=True) as connection:
         inserted = await connection.execute(
             "INSERT INTO promo_redemptions (user_id, promo_code) VALUES (?, ?) "
             "ON CONFLICT(user_id, promo_code) DO NOTHING",
             "INSERT INTO promo_redemptions (user_id, promo_code) VALUES (%s, %s) "
             "ON CONFLICT(user_id, promo_code) DO NOTHING",
-            (user_id, PROMO_CODE),
+            (user_id, promo_code),
         )
         if inserted == 0:
             return None
 
-        await connection.execute(
-            """
-            INSERT INTO balances (user_id, balance_cents)
-            VALUES (?, ?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET balance_cents = balance_cents + excluded.balance_cents
-            """,
-            """
-            INSERT INTO balances (user_id, balance_cents)
-            VALUES (%s, %s)
-            ON CONFLICT(user_id)
-            DO UPDATE SET balance_cents = balances.balance_cents + excluded.balance_cents
-            """,
-            (user_id, PROMO_AMOUNT_CENTS),
+        balance = await update_balance_in_transaction(
+            connection,
+            user_id,
+            Decimal(amount_cents) / 100,
         )
-        row = await connection.fetchone(
-            "SELECT balance_cents FROM balances WHERE user_id = ?",
-            "SELECT balance_cents FROM balances WHERE user_id = %s",
-            (user_id,),
-        )
-    return Decimal(row[0]) / 100
+        if balance is None:
+            raise RuntimeError(f"Не удалось начислить промокод пользователю {user_id}.")
+    return balance
 
 
 async def api_promo(request):
@@ -614,13 +791,20 @@ async def api_promo(request):
         return api_error("Недействительная авторизация", status=401)
 
     promo = payload.get("promo")
-    if not isinstance(promo, str) or promo.strip().upper() != PROMO_CODE:
+    if not isinstance(promo, str):
+        return api_error("Неверный промокод.")
+    promo_code = promo.strip().upper()
+    amount_cents = PROMO_CODES.get(promo_code)
+    if amount_cents is None:
         return api_error("Неверный промокод.")
 
-    balance = await redeem_promo(user_id)
+    balance = await redeem_promo(user_id, promo_code, amount_cents)
     if balance is None:
         return api_error("Промокод уже активирован.")
-    return web.json_response({"ok": True, "balance": float(balance)})
+    response = {"ok": True, "balance": float(balance)}
+    if promo_code == "ANTON67":
+        response["message"] = "Промокод ANTON67 активирован! +67 ₽"
+    return web.json_response(response)
 
 
 async def api_daily(request):
@@ -643,6 +827,24 @@ async def api_daily(request):
         "message": "Бонус получен!",
         "balance": float(balance),
     })
+
+
+async def api_spin(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полем _auth.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    _, hours_remaining = await claim_wheel_spin(user_id)
+    if hours_remaining is not None:
+        return web.json_response({
+            "ok": False,
+            "error": f"Колесо будет доступно через {hours_remaining} часов",
+        })
+    return web.json_response({"ok": True, "message": "Можно крутить!"})
 
 
 async def health_check(request):
@@ -671,10 +873,13 @@ app.router.add_get("/api/user", api_user)
 app.router.add_post("/api/user", api_user)
 app.router.add_post("/api/bet", api_bet)
 app.router.add_post("/api/win", api_win)
+app.router.add_post("/api/plinko", api_plinko)
+app.router.add_post("/api/anton-slots", api_anton_slots)
 app.router.add_post("/api/stats", api_stats)
 app.router.add_post("/api/winners", api_winners)
 app.router.add_post("/api/promo", api_promo)
 app.router.add_post("/api/daily", api_daily)
+app.router.add_post("/api/spin", api_spin)
 
 
 @dp.message(Command("start"))
