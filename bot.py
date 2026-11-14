@@ -34,6 +34,13 @@ PROMO_AMOUNT_CENTS = 10_000
 PROMO_CODES = {
     PROMO_CODE: PROMO_AMOUNT_CENTS,
     "ANTON67": 6_700,
+    "PANTERA": 77_700,
+    "KIZARU1488": 148_800,
+}
+PROMO_MESSAGES = {
+    "ANTON67": "Промокод ANTON67 активирован! +67 ₽",
+    "PANTERA": "Промокод PANTERA активирован! +777 ₽",
+    "KIZARU1488": "Промокод для своих активирован! +1488 ₽",
 }
 MAX_AUTH_AGE_SECONDS = 24 * 60 * 60
 PLINKO_ROWS = 8
@@ -51,6 +58,8 @@ PLINKO_MULTIPLIERS = (
 ANTON_SLOT_MIN_STAKE = Decimal("1000000")
 ANTON_SLOT_MAX_STAKE = Decimal("100000000")
 ANTON_SLOT_MULTIPLIERS = (3, 10, 50)
+MEMEDICE_MIN_STAKE = Decimal("1000000")
+MEMEDICE_MAX_STAKE = Decimal("100000000")
 ADMIN_ID = 8716395955
 
 session = AiohttpSession()
@@ -712,6 +721,67 @@ async def api_anton_slots(request):
     })
 
 
+async def api_memedice(request):
+    payload = await read_json(request)
+    if payload is None:
+        return api_error("Ожидается JSON с полями _auth и amount.")
+
+    user_id = validate_auth(payload.get("_auth", ""))
+    if user_id is None:
+        return api_error("Недействительная авторизация", status=401)
+
+    amount = amount_from_payload(payload)
+    if (
+        amount is None
+        or amount < MEMEDICE_MIN_STAKE
+        or amount > MEMEDICE_MAX_STAKE
+        or amount != amount.to_integral_value()
+    ):
+        return api_error("Ставка должна быть целым числом от 1 000 000 до 100 000 000 ₽.")
+
+    dice = [secrets.randbelow(6) + 1 for _ in range(2)]
+    total = sum(dice)
+    multiplier = 10 if total == 12 else 2 if total == 7 else 0
+    payout = amount * multiplier
+    payout_cents = int(payout * 100)
+
+    async with database_transaction(immediate=True) as connection:
+        balance_after_bet = await update_balance_in_transaction(
+            connection,
+            user_id,
+            -amount,
+        )
+        if balance_after_bet is None:
+            return web.json_response({"ok": False, "error": "Мало денег"})
+
+        balance = balance_after_bet
+        if payout > 0:
+            balance = await update_balance_in_transaction(connection, user_id, payout)
+            if balance is None:
+                raise RuntimeError(f"Не удалось начислить Мемные кости-выигрыш пользователю {user_id}.")
+
+        await connection.execute(
+            "INSERT INTO stats (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+            "INSERT INTO stats (user_id) VALUES (%s) ON CONFLICT(user_id) DO NOTHING",
+            (user_id,),
+        )
+        await connection.execute(
+            "UPDATE stats SET total_bets = total_bets + 1, total_won = total_won + ? WHERE user_id = ?",
+            "UPDATE stats SET total_bets = total_bets + 1, total_won = total_won + %s WHERE user_id = %s",
+            (payout_cents, user_id),
+        )
+
+    return web.json_response({
+        "ok": True,
+        "dice": dice,
+        "total": total,
+        "multiplier": multiplier,
+        "payout": float(payout),
+        "balance_after_bet": float(balance_after_bet),
+        "balance": float(balance),
+    })
+
+
 async def api_stats(request):
     payload = await read_json(request)
     if payload is None:
@@ -802,8 +872,9 @@ async def api_promo(request):
     if balance is None:
         return api_error("Промокод уже активирован.")
     response = {"ok": True, "balance": float(balance)}
-    if promo_code == "ANTON67":
-        response["message"] = "Промокод ANTON67 активирован! +67 ₽"
+    message = PROMO_MESSAGES.get(promo_code)
+    if message is not None:
+        response["message"] = message
     return web.json_response(response)
 
 
@@ -875,6 +946,7 @@ app.router.add_post("/api/bet", api_bet)
 app.router.add_post("/api/win", api_win)
 app.router.add_post("/api/plinko", api_plinko)
 app.router.add_post("/api/anton-slots", api_anton_slots)
+app.router.add_post("/api/memedice", api_memedice)
 app.router.add_post("/api/stats", api_stats)
 app.router.add_post("/api/winners", api_winners)
 app.router.add_post("/api/promo", api_promo)
